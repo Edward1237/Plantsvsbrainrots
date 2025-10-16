@@ -1,15 +1,18 @@
-
 import os
 import json
+import time
 from typing import Optional, List
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+# small async web server
+from aiohttp import web
+
 CONFIG_PATH = "config.json"
 DATA_PATH = "data.json"
-
+START_TIME = time.monotonic()
 
 # ------------- Persistence -------------
 def load_json(path, default):
@@ -19,24 +22,20 @@ def load_json(path, default):
     except FileNotFoundError:
         return default
 
-
 def save_json(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
 
-
 # ------------- Config and per guild data -------------
 config = load_json(CONFIG_PATH, {"default_prefix": "!", "owner_ids": []})
 data = load_json(DATA_PATH, {})
-
-# data structure per guild id, as string
+# per guild structure, saved by guild id as string
 # {
 #   "prefix": "!",
 #   "enabled": true,
 #   "log_channel_id": 0,
 #   "watchlist": [user_id, ...]
 # }
-
 
 def gset(guild: discord.Guild) -> dict:
     gid = str(guild.id)
@@ -49,10 +48,8 @@ def gset(guild: discord.Guild) -> dict:
         }
     return data[gid]
 
-
 def save_data():
     save_json(DATA_PATH, data)
-
 
 # ------------- Intents and prefix -------------
 intents = discord.Intents.default()
@@ -60,17 +57,14 @@ intents.guilds = True
 intents.members = True
 intents.message_content = True
 
-
 def prefix_getter(bot, message):
     if not message.guild:
         return config.get("default_prefix", "!")
     return gset(message.guild).get("prefix", config.get("default_prefix", "!"))
 
-
 bot = commands.Bot(command_prefix=prefix_getter, intents=intents)
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-
 
 # ------------- Permissions helpers -------------
 def has_manage_guild():
@@ -80,17 +74,12 @@ def has_manage_guild():
         return ctx.author.guild_permissions.manage_guild
     return commands.check(predicate)
 
-
 def role_is_admin(role: discord.Role) -> bool:
-    perms = role.permissions
-    return perms.administrator
-
+    return role.permissions.administrator
 
 async def get_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
-    gs = gset(guild)
-    cid = gs.get("log_channel_id") or 0
+    cid = gset(guild).get("log_channel_id") or 0
     return guild.get_channel(cid) if cid else None
-
 
 async def log(guild: discord.Guild, text: str):
     ch = await get_log_channel(guild)
@@ -100,32 +89,30 @@ async def log(guild: discord.Guild, text: str):
         except Exception:
             pass
 
-
 async def strip_admin_roles(member: discord.Member, reason: str) -> List[discord.Role]:
     removed = []
     me = member.guild.me
     if me is None:
         return removed
-    if not member.guild.me.guild_permissions.manage_roles:
+    if not me.guild_permissions.manage_roles:
         return removed
 
     for role in sorted(member.roles, key=lambda r: r.position, reverse=True):
         if role.is_default():
             continue
-        if role_is_admin(role):
-            if me.top_role > role:
-                try:
-                    await member.remove_roles(role, reason=reason)
-                    removed.append(role)
-                except discord.Forbidden:
-                    pass
-                except discord.HTTPException:
-                    pass
+        if role_is_admin(role) and me.top_role > role:
+            try:
+                await member.remove_roles(role, reason=reason)
+                removed.append(role)
+            except discord.Forbidden:
+                pass
+            except discord.HTTPException:
+                pass
     return removed
 
-
 async def kick_member(member: discord.Member, reason: str) -> bool:
-    if not member.guild.me.guild_permissions.kick_members:
+    me = member.guild.me
+    if not me or not me.guild_permissions.kick_members:
         return False
     try:
         await member.kick(reason=reason)
@@ -135,14 +122,11 @@ async def kick_member(member: discord.Member, reason: str) -> bool:
     except discord.HTTPException:
         return False
 
-
 # ------------- Core guard logic -------------
 async def enforce_guard(member: discord.Member, join_event: bool = True):
-    guild = member.guild
-    gs = gset(guild)
+    gs = gset(member.guild)
     if not gs.get("enabled", True):
         return
-
     if member.id not in gs.get("watchlist", []):
         return
 
@@ -153,9 +137,7 @@ async def enforce_guard(member: discord.Member, join_event: bool = True):
     removed_txt = ", ".join([r.name for r in removed]) if removed else "none"
     action = f"Removed admin roles: {removed_txt}. "
     action += "Kicked." if kicked else "Kick failed or no permission."
-
-    await log(guild, f"⚠️ Guard action on {member.mention} ({member.id}). {action}")
-
+    await log(member.guild, f"⚠️ Guard action on {member.mention} ({member.id}). {action}")
 
 # ------------- Events -------------
 @bot.event
@@ -165,18 +147,20 @@ async def on_ready():
     for g in bot.guilds:
         gset(g)
     save_data()
-
+    # start the web server once
+    if not getattr(bot, "_web_started", False):
+        bot._web_started = True
+        bot.loop.create_task(start_web_server())
+        print("Web server task started")
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     gset(guild)
     save_data()
 
-
 @bot.event
 async def on_member_join(member: discord.Member):
     await enforce_guard(member, join_event=True)
-
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -187,7 +171,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             await enforce_guard(after, join_event=False)
     except Exception:
         pass
-
 
 # ------------- Converters -------------
 async def to_user_id(ctx: commands.Context, token: str) -> Optional[int]:
@@ -205,12 +188,10 @@ async def to_user_id(ctx: commands.Context, token: str) -> Optional[int]:
     except Exception:
         return None
 
-
 # ------------- Commands -------------
 @bot.group(name="guard", invoke_without_command=True)
 @has_manage_guild()
 async def guard_group(ctx: commands.Context):
-    gid = str(ctx.guild.id)
     gs = gset(ctx.guild)
     await ctx.send(
         f"Guard is {'enabled' if gs.get('enabled', True) else 'disabled'}. "
@@ -219,24 +200,19 @@ async def guard_group(ctx: commands.Context):
         f"Log channel: {gs.get('log_channel_id') or 'not set'}."
     )
 
-
 @guard_group.command(name="enable")
 @has_manage_guild()
 async def guard_enable(ctx: commands.Context):
-    gs = gset(ctx.guild)
-    gs["enabled"] = True
+    gset(ctx.guild)["enabled"] = True
     save_data()
     await ctx.send("Guard enabled.")
-
 
 @guard_group.command(name="disable")
 @has_manage_guild()
 async def guard_disable(ctx: commands.Context):
-    gs = gset(ctx.guild)
-    gs["enabled"] = False
+    gset(ctx.guild)["enabled"] = False
     save_data()
     await ctx.send("Guard disabled.")
-
 
 @guard_group.command(name="setlog")
 @has_manage_guild()
@@ -249,7 +225,6 @@ async def guard_setlog(ctx: commands.Context, channel: Optional[discord.TextChan
         gs["log_channel_id"] = channel.id
         await ctx.send(f"Log channel set to {channel.mention}.")
     save_data()
-
 
 @guard_group.command(name="add")
 @has_manage_guild()
@@ -267,7 +242,6 @@ async def guard_add(ctx: commands.Context, *, who: str):
     await ctx.send(f"Added `{uid}` to the watchlist.")
     await log(ctx.guild, f"➕ Watchlist add by {ctx.author.mention}: `{uid}`")
 
-
 @guard_group.command(name="remove")
 @has_manage_guild()
 async def guard_remove(ctx: commands.Context, *, who: str):
@@ -284,12 +258,10 @@ async def guard_remove(ctx: commands.Context, *, who: str):
     await ctx.send(f"Removed `{uid}` from the watchlist.")
     await log(ctx.guild, f"➖ Watchlist remove by {ctx.author.mention}: `{uid}`")
 
-
 @guard_group.command(name="list")
 @has_manage_guild()
 async def guard_list(ctx: commands.Context):
-    gs = gset(ctx.guild)
-    wl = gs.get("watchlist", [])
+    wl = gset(ctx.guild).get("watchlist", [])
     if not wl:
         await ctx.send("Watchlist is empty.")
         return
@@ -303,7 +275,6 @@ async def guard_list(ctx: commands.Context):
     more = "" if len(wl) <= 50 else f"\n... and {len(wl) - 50} more"
     await ctx.send("Watchlist:\n" + "\n".join(lines) + more)
 
-
 @commands.guild_only()
 @bot.command(name="setprefix")
 @has_manage_guild()
@@ -311,11 +282,9 @@ async def setprefix(ctx: commands.Context, prefix: str):
     if not prefix or len(prefix) > 5:
         await ctx.send("Provide a prefix 1 to 5 characters.")
         return
-    gs = gset(ctx.guild)
-    gs["prefix"] = prefix
+    gset(ctx.guild)["prefix"] = prefix
     save_data()
     await ctx.send(f"Prefix updated to `{prefix}`")
-
 
 @commands.guild_only()
 @bot.command(name="status")
@@ -328,7 +297,6 @@ async def status_cmd(ctx: commands.Context):
         f"Log channel id: {gs.get('log_channel_id') or 'not set'}"
     )
 
-
 @commands.guild_only()
 @bot.command(name="testkick")
 @has_manage_guild()
@@ -337,10 +305,36 @@ async def testkick(ctx: commands.Context, member: discord.Member):
         await ctx.send("I will not kick myself.")
         return
     await enforce_guard(member, join_event=False)
-    await ctx.send("Enforcement attempted. Check the log channel for details.")
+    await ctx.send("Enforcement attempted, check the log channel for details.")
 
+# ------------- Tiny web server -------------
+async def handle_root(request: web.Request):
+    uptime = round(time.monotonic() - START_TIME, 2)
+    guilds = len(bot.guilds) if bot.user else 0
+    return web.json_response({
+        "ok": True,
+        "bot_user": str(bot.user) if bot.user else None,
+        "guild_count": guilds,
+        "uptime_seconds": uptime
+    })
 
+async def handle_health(request: web.Request):
+    return web.Response(text="ok")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/health", handle_health)
+
+    port = int(os.getenv("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Web server listening on 0.0.0.0:{port}")
+
+# ------------- Run -------------
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("DISCORD_TOKEN is not set. Add it to a .env file or your environment.")
+        raise SystemExit("DISCORD_TOKEN is not set, add it to a .env file or your environment.")
     bot.run(TOKEN)
